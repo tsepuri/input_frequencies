@@ -1,0 +1,614 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r}
+library(httr)
+library(jsonlite)
+library(dotenv)
+library(ggplot2)
+library(stringr)
+library(spacyr)
+library(dplyr)
+# HuggingFace API key needs to be defined as API_KEY in .env
+load_dot_env()
+wd <- "/path/to/dir/"
+setwd(wd)
+```
+
+## Setup
+
+### Utility methods
+
+Entropy for type and token frequencies
+
+```{r}
+entropy <- function(counts) {
+  perc <- counts$n / sum(counts$n)
+  # Compute Hnorm
+  Hnorm <- -sum(perc * log2(perc)) / log2(length(counts))
+  return(Hnorm/10)
+}
+```
+
+Get type and token frequencies
+
+```{r}
+tt_freqs <- function(df) {
+  df_count <- df %>%
+    count(lemma, sort=TRUE)
+  type_freq <- nrow(df_count)
+  token_freq <- sum(df_count$n)
+  df_entropy <- entropy(df_count)
+  ratio <- type_freq / token_freq
+  return(data.frame(type_f=type_freq,token_f=token_freq,tt_ratio=ratio,entropy=df_entropy))
+}
+```
+
+Type and token frequencies for regular and irregular past tense forms. 'ed' stands for '-ed' since all regular past tense forms end with '-ed'
+
+```{r}
+ed_type_token <- function(past_verbs) {
+  ed_verbs <- past_verbs %>%
+    filter(grepl("ed$", token))
+  print(ed_verbs)
+  ed_ratio <- (count(ed_verbs) / count(past_verbs))$n
+  ed_df <- tt_freqs(ed_verbs)
+  ed_df$ed_ratio <- ed_ratio
+  return(ed_df)
+}
+```
+
+```{r}
+non_ed_type_token <- function(past_verbs) {
+  non_ed_verbs <- past_verbs %>%
+    filter(!grepl("ed$", token))
+  #print(ed_verbs)
+  non_ed_ratio <- (count(non_ed_verbs) / count(past_verbs))$n
+  non_ed_df <- tt_freqs(non_ed_verbs)
+  non_ed_df$non_ed_ratio <- non_ed_ratio
+  return(non_ed_df)
+}
+```
+
+Segmenting past tense verb information, from a list of verbs
+
+```{r}
+past_tense_seg <- function(verbs) {
+  past_tense_verbs <- verbs %>%
+    filter(tag == "VBN" | tag == "VBD") %>% 
+    mutate(ends_with_ed = grepl("ed$", token))
+  past_count <- past_tense_verbs %>%
+    count(lemma, sort=TRUE)
+  ed_values <- ed_type_token(past_tense_verbs)
+  print(count(past_tense_verbs))
+  print(count(verbs))
+  ed_values$past_ratio <- (count(past_tense_verbs) / count(verbs))$n
+  return(ed_values)
+}
+```
+
+Sentence segmentation using HuggingFace model and further cleaning of that model
+
+```{r}
+add_punctuation <- function(input_text) {
+  # Load API key from .env file
+  api_key <- Sys.getenv("API_KEY")
+  # Define API endpoint and headers
+  api_url <- "https://api-inference.huggingface.co/models/oliverguhr/fullstop-punctuation-multilang-large"
+  headers <- add_headers(Authorization = paste("Bearer", api_key))
+  
+  # Define payload as a list
+  payload <- list(inputs = input_text)
+  
+  # Make POST request and return result
+  response <- POST(api_url, headers = headers, body = toJSON(payload))
+  result <- content(response, as = "text")
+  json_str <- result[[1]]
+  # Remove the escaped quotes to make the string valid JSON
+  json_str <- gsub('\\"', '"', json_str, fixed = TRUE)
+  # Parse the JSON into a data frame
+  output <- fromJSON(json_str)[1]
+  return(parse_output(output[1]))
+}
+parse_output <- function(output) {
+  df <- data.frame(text = sapply(output, function(x) x$word), entity = sapply(output, function(x) ifelse(x$entity_group == "0", "", x$entity_group)))
+  output$word_entity <- paste(output$word, ifelse(output$entity_group == "0", "", output$entity_group), sep = "")
+  df$word_entity <- paste(df$text, ifelse(df$entity != "", df$entity, ""), sep="")
+  result <- paste(df$word_entity, collapse = " ")
+  return(result)
+}
+```
+
+Getting the parts of speech from a list of lines of text using Spacy
+
+```{r}
+pos_spacy <- function(lines) {
+  spacy_initialize(model = "en_core_web_md")
+  sentences <- spacy_parse(parsed_lines, "sentencizer",pos=TRUE, tag=TRUE, lemma=TRUE,entity=FALSE, dependency=TRUE, nounphrase=TRUE)
+  df <- as.data.frame(sentences)
+  parsed_text <- sentences
+  pos <- df$pos
+  tokens <- df$lemma
+  return(df)
+}
+```
+
+Initial data stored for every data source
+
+```{r}
+further_parsing <- function(parsed_lines) {
+  df <- pos_spacy(parsed_lines)
+  num_words <- nrow(df)
+  num_utterances <- length(unique(df$sentence))
+  df_count <- df %>%
+    count(lemma, sort=TRUE)
+  word_type_freq <- nrow(df_count)
+  word_token_freq <- sum(df_count$n)
+  mlu <- num_words / num_utterances
+  new_df <- data.frame(
+    link, video_name, file_name, viewcount, length_in_secs, metadata, programmed, educational, youtubekids, live, 
+    type_frequency=c(word_type_freq), token_frequency=c(word_token_freq),num_utterances,mlu, output_file_name
+  )
+  current_data <- adding_info(new_df)
+  saveRDS(df, file=output_file_name)
+  return(current_data)
+}
+```
+
+Further analyzing the parts of speech to get transitive verbs, intransitive verbs, nouns and verbs
+
+```{r}
+pos_list <- function(df) {
+  all_verbs <- df %>%
+    mutate(next_pos = lead(pos),
+           next_word = lead(lemma),
+           next_pos2 = lead(pos, n = 2),
+           next_word2 = lead(lemma, n = 2),
+           next_pos3 = lead(pos, n = 3),
+           next_word3 = lead(lemma, n = 3)) %>%
+    filter(pos %in% c("VERB"))
+  #verb_freqs <- tt_freqs(all_verbs)
+  #verb_past_tense <- past_tense_seg(all_verbs)
+  all_nouns <- df %>%
+    filter(pos %in% c("NOUN", "PRON"))
+  transitive_verbs <- all_verbs %>%
+    filter(lemma != 's') %>%
+    filter(next_pos %in% c("NOUN", "PRON") |
+             (next_pos == "DET" & next_pos2 == "NOUN") |
+             (next_pos == "ADJ" & next_pos2 == "NOUN") |
+             (next_pos == "DET" & next_pos2 == "ADJ" & next_pos3 == "NOUN")) 
+  intransitive_verbs <- all_verbs %>%
+    filter(!(next_pos %in% c("NOUN", "PRON") |
+               (next_pos == "DET" & next_pos2 == "NOUN") |
+               (next_pos == "ADJ" & next_pos2 == "NOUN") |
+               (next_pos == "DET" & next_pos2 == "ADJ" & next_pos3 == "NOUN")))
+  return(list(tv=transitive_verbs, iv=intransitive_verbs, av=all_verbs, an=all_nouns))
+}
+```
+
+Adding new information to the main Rda file
+
+```{r}
+adding_info <- function(df, full_file="youtube.Rda") {
+  if(file.exists(full_file)) {
+    olddata <- readRDS(file=full_file)
+    new_df <- rbind(df, olddata)
+    saveRDS(new_df,file=full_file)
+  }
+  else {
+    saveRDS(df, file=full_file)
+  }
+  current_data <- readRDS(file=full_file)
+  return(current_data)
+}
+update_info <- function(df, val, curr="ryan.vtt", full_file="youtube.Rda") {
+  row_index <- which(df$file_name == curr)
+  df[row_index, "mlu"] <- val
+  saveRDS(df, file=full_file)
+  return(df)
+}
+```
+
+Cleaning the input data from CHILDES
+
+```{r}
+parse_mot_data <- function(lines) {
+  results <- list()
+  in_mot <- FALSE
+  mot_text <- ""
+  for (line in lines) {
+    if (startsWith(line, "*CHI")) {
+      in_mot <- TRUE
+      mot_text <- paste(mot_text, str_replace(line, "^\\*CHI:\\s+", ""))
+    }
+    else if (startsWith(line, "*") || startsWith(line, "%")) {
+      in_mot <- FALSE
+    }
+    else if (in_mot) {
+      mot_text <- paste(mot_text, line)
+    }
+  }
+  mot_text <- str_replace_all(mot_text, "@g", "")
+  mot_text <- gsub("[^[:alnum:][:space:]?!.]", "", mot_text)
+  return(mot_text)
+}
+```
+
+Cleaning the input data from YouTube captions. good_cc_parsing accounts for actual captions that are formatted differently than the automated ones
+
+```{r}
+parse_vtt_w_punctuation <- function(input_text) {
+  indices <- grep("<c>", input_text)
+  spoken_lines <- gsub("<[^>]+>", "", input_text[indices])
+  pasted_lines <- paste(spoken_lines, collapse=" ")
+  if (length(pasted_lines) <= 1) {
+    pasted_lines = good_cc_parsing(input_text)
+  }
+  punctuated_lines <- add_punctuation(pasted_lines)
+  return(punctuated_lines)
+}
+good_cc_parsing <- function(input_text) {
+  modified_text <- ""
+  # loop through each line of the input text
+  for (i in seq_along(input_text)) {
+    
+    # check if the line starts with a timestamp
+    if (grepl("^\\d{2}:\\d{2}:\\d{2}.\\d{3}", input_text[i])) {
+      
+      # if the line starts with a timestamp, skip it and the next line
+      i <- i + 1
+      
+    } else {
+      input_text[i] = gsub('"', '', input_text[i])
+      # if the line does not start with a timestamp, check if it starts with a narrator's name
+      if (grepl("^\\w+:", input_text[i])) {
+        
+        # if the line starts with a narrator's name, remove it
+        modified_text <- paste(modified_text, sub("^\\w+:\\s*", "", input_text[i]))
+        
+      } else {
+        # if the line does not start with a narrator's name, append it to the modified text
+        modified_text <- paste(modified_text, input_text[i])
+      }
+      
+    }
+    
+  }
+  return(modified_text)
+}
+```
+
+Util method used to merge frames. Initial versions of frames did not include information so this had to be used.
+
+```{r}
+mergeFrames <- function(df, final_file="youtube.Rda") {
+  df1 <- readRDS(file=final_file)
+  df2 <- df
+  commonNames <- names(df1)[which(colnames(df1) %in% colnames(df2))]
+  commonNames <- commonNames[commonNames != "file_name"]
+  dfmerge<- merge(df1,df2,by="file_name",all=T)
+  for(i in commonNames){
+    left <- paste(i, ".x", sep="")
+    right <- paste(i, ".y", sep="")
+    dfmerge[is.na(dfmerge[left]),left] <- dfmerge[is.na(dfmerge[left]),right]
+    dfmerge[right]<- NULL
+    colnames(dfmerge)[colnames(dfmerge) == left] <- i
+  }
+  saveRDS(dfmerge, file=final_file)
+  return(readRDS(file=final_file))
+}
+```
+
+This was a use-case for the mergeFrames method above
+
+```{r}
+file_name <- "Nadig/135.cha"
+output_file_name <- "135.Rda"
+new_df <- data.frame(
+  file_name, output_file_name, link="N/A")
+new_df <- mergeFrames(new_df)
+```
+
+Quick util for when the last column added is incorrect
+
+```{r}
+remove_last_column <- function() {
+  current_data <- readRDS("youtube.Rda")
+  current_data <- current_data[-c(1),]
+  saveRDS(current_data, "youtube.Rda")
+}
+```
+
+```{r}
+plot_distribution <- function(top_words, name) {
+  # Create a bar graph of the top 25 words
+  ggplot(top_words, aes(x = reorder(lemma, -n), y = n)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  xlab("Word") +
+  ylab("Frequency") +
+  theme(axis.text.y = element_text(size = 10)) +
+  theme(axis.text.x = element_text(size = 5)) +
+  ggtitle(name)
+}
+```
+
+### Workflow
+
+Below is the process followed to add every file to the dataframe.\
+The following text is changed and is the basis of every video/transcript added.
+
+```{r}
+output_file_name <- "cocomelon.Rda"
+file_name <- "example/cocomelon.vtt"
+video_name <- "You Can Ride a Bike Song ｜ @CoComelon & Kids Songs ｜ Learning Videos For Toddlers"
+viewcount <- 154000000
+link <- "https://www.youtube.com/watch?v=zj3UYhSsrwU"
+programmed <- TRUE
+youtubekids <- TRUE
+educational <- TRUE
+live <- FALSE
+length_in_secs <- 2040
+metadata <- ""
+```
+
+```{r}
+add_file_info <- function () {
+  lines <- readLines(file_name)
+  # If it is a video and not a transcript
+  if (viewcount > 0) {
+    parsed_lines <- parse_vtt_w_punctuation(lines)
+  } else {
+    parsed_lines <- parse_mot_data(lines)
+  }
+  current_data <- further_parsing(parsed_lines)
+  return(current_data)
+}
+#df <- pos_spacy(parsed_lines)
+#saveRDS(df, file=output_file_name)
+```
+
+```{r}
+#add_file_info()
+current_data <- readRDS(file="youtube.Rda")
+current_data
+```
+
+## Data analysis
+
+The main category for data analysis was direct comparison of YouTube Kids to maternal input. Further categories included comparing educational videos to non-educational ones and comparing programmed videos to non-programmed ones. The data pipeline is set up in a way where it can be extended to look at live videos vs non-live videos and add other input sources such as YouTube or a TV show.
+
+```{r}
+df <- readRDS(file="youtube.Rda")
+df_filtered <- subset(df, !(grepl("output", video_name) | (youtubekids == FALSE & viewcount > 0)))
+```
+
+### Video accuracy
+
+The video that was manually assessed for accuracy was Ryan's Mystery Playdate Episode 1 for international RTR Fans.
+
+```{r}
+ryan_vid <- readRDS(df_filtered[c(9),]$output_file_name)
+wrong_tokens <- 11
+right_tokens <- count(ryan_vid)$n - wrong_tokens
+missing_tokens <- 22
+right_sentence_segmentations <- 51
+# Sentence segmentation too late
+fwd_sentence_segmentations <- 13
+# Sentence segmentation too early
+back_sentence_seg <- 3
+total_sentences <- df_filtered[c(9),]$num_utterances
+new_sentences <- total_sentences + fwd_sentence_segmentations - back_sentence_seg
+total_tokens <- df_filtered[c(9),]$token_frequency
+new_total_tokens <- total_tokens + missing_tokens
+orig_mlu <- df_filtered[c(9),]$mlu
+new_mlu <- new_total_tokens / new_sentences
+```
+
+Precision and recall calculations
+
+```{r}
+TP_sent <- right_sentence_segmentations
+FP_sent <- fwd_sentence_segmentations + back_sentence_seg
+FN_sent <- total_sentences - TP_sent
+
+precision_sent <- TP_sent / (TP_sent + FP_sent)
+recall_sent <- TP_sent / (TP_sent + FN_sent)
+
+# Token recognition
+TP_token <- right_tokens
+FP_token <- wrong_tokens
+FN_token <- new_total_tokens - TP_token
+
+precision_token <- TP_token / (TP_token + FP_token)
+recall_token <- TP_token / (TP_token + FN_token)
+```
+
+Accuracy table
+
+```{r}
+df <- data.frame(
+  word_precision=precision_token,
+  word_recall=recall_token,
+  sentence_precision=precision_sent,
+  sentence_recall=recall_sent,
+  original_mlu = orig_mlu,
+  new_mlu = new_mlu
+)
+
+# Print the data frame
+df
+```
+
+### Mean lengths of utterances
+
+```{r}
+# calculate weighted mean length of utterance by youtubekids
+mlu_table <- aggregate(df_filtered[,c("mlu","num_utterances")], by=list(df_filtered$youtubekids), FUN=function(x) sum(x[1]*x[2])/sum(x[2]))
+
+# add column names to the table
+colnames(mlu_table) <- c("youtubekids", "mlu")
+
+# print the table
+print(mlu_table)
+```
+
+### Datasets
+
+```{r}
+df_youtubekids <- subset(df_filtered, (youtubekids == TRUE))
+df_maternal <- subset(df_filtered, (youtubekids == FALSE))
+df_programmed <- subset(df_youtubekids, (programmed == TRUE))
+df_nonprogrammed <- subset(df_youtubekids, (programmed == FALSE))
+df_educational <- subset(df_youtubekids, (educational == TRUE))
+df_uneducational <- subset(df_youtubekids, (educational == FALSE))
+```
+
+Get the aggregated list of tokens with part of speech tags
+
+```{r}
+combined <- function(df) {
+  df_list <- lapply(df$output_file_name, function(name) {
+  readRDS(name)
+})
+  # Use do.call() to combine the data frames into a single data frame
+  combined_list <- do.call(rbind, df_list)
+  return(combined_list)
+}
+youtubekids_data <- combined(df_youtubekids)
+maternal_data <- combined(df_maternal)
+yk_pos <- pos_list(youtubekids_data)
+m_pos <- pos_list(maternal_data)
+prog_pos <- pos_list(combined(df_programmed))
+nonprog_pos <- pos_list(combined(df_nonprogrammed))
+edu_pos <- pos_list(combined(df_educational))
+nonedu_pos <- pos_list(combined(df_uneducational))
+```
+
+### Verbs and nouns
+
+#### Type and token frequency
+
+```{r}
+yk_freqs <- tt_freqs(yk_pos$av)
+m_freqs <- tt_freqs(m_pos$av)
+yk_freqs_nouns <- tt_freqs(yk_pos$an)
+m_freqs_nouns <- tt_freqs(m_pos$an)
+nv <- data.frame(verbs=rbind(yk_freqs, m_freqs), nouns=rbind(yk_freqs_nouns, m_freqs_nouns))
+rownames(nv) <- c("YouTube Kids", "Maternal Input")
+nv
+```
+
+Very similar entropy, but more types seen in general for both nouns and verbs on YouTube Kids
+
+### Transitive and intransitive verbs
+
+#### Type and token frequency
+
+```{r}
+yk_freqs <- tt_freqs(yk_pos$tv)
+m_freqs <- tt_freqs(m_pos$tv)
+yk_freqs_iv <- tt_freqs(yk_pos$iv)
+m_freqs_iv <- tt_freqs(m_pos$iv)
+edu_pos <- pos_list(combined(df_educational))
+nonedu_pos <- pos_list(combined(df_uneducational))
+ti <- data.frame(transitive=rbind(yk_freqs, m_freqs, tt_freqs(prog_pos$tv), tt_freqs(nonprog_pos$tv), tt_freqs(edu_pos$tv), tt_freqs(nonedu_pos$tv)), intransitive=rbind(yk_freqs_iv, m_freqs_iv, tt_freqs(prog_pos$iv), tt_freqs(nonprog_pos$iv), tt_freqs(edu_pos$iv), tt_freqs(nonedu_pos$iv)))
+rownames(ti) <- c("YouTube Kids", "Maternal Input", "Programmed", "Non-programmed", "Educational", "Non-educational")
+ti
+```
+
+Slightly higher entropy with maternal input and much lower ratio\
+Programmed content seems to have a much lower entropy
+
+```{r}
+yktv_df <- yk_pos$tv %>%
+    count(lemma, sort=TRUE)
+top_words <- yktv_df[order(-yktv_df$n),][1:25,]
+
+# Create a bar graph of the top 25 words
+plot_distribution(top_words, "Top 25 Most Popular YouTube Kids Transitive Verbs")
+
+```
+
+```{r}
+mtv_df <- m_pos$tv %>%
+    count(lemma, sort=TRUE)
+top_words <- mtv_df[order(-mtv_df$n),][1:25,]
+
+# Create a bar graph of the top 25 words
+plot_distribution(top_words, "Top 25 Most Popular Maternal Input Transitive Verbs")
+```
+
+#### Collostructional analysis
+
+Collostructional analysis was used to measure the verb-transitive contingency, the strength of a verb being present in a transitive slot
+
+Flach, Susanne. 2021. *Collostructions: An R implementation for the family of collostructional methods*. Package version v.0.2.0, <https://sfla.ch/collostructions/.>
+
+```{r}
+# Collostructions package installation:
+#install.packages(file.choose(), repos = NULL)
+library(collostructions)
+```
+
+Formatting data to be accepted by collostructional parser
+
+```{r}
+yk_counts <- youtubekids_data %>%
+    count(lemma, sort=TRUE)
+m_counts <- maternal_data %>%
+    count(lemma, sort=TRUE)
+yktv_df <- subset(yktv_df, lemma %in% mtv_df$lemma)
+mtv_df <- subset(mtv_df, lemma %in% yktv_df$lemma)
+colnames(yk_counts)[2] <- "CORP.FREQ"
+colnames(yktv_df)[2] <- "CXN.FREQ"
+c_yk <- merge(yk_counts, yktv_df, by="lemma")
+c_yk_all <- data.frame(WORD=c_yk$lemma, CXN.FREQ=c_yk$CXN.FREQ, CORP.FREQ=c_yk$CORP.FREQ)
+```
+
+Running it through
+
+```{r}
+collex(c_yk_all, 2547) -> c_yk_all.out
+data.frame(word=c_yk_all.out$COLLEX, observation=c_yk_all.out$OBS, frequency=c_yk_all.out$CORP.FREQ, coll_strength=c_yk_all.out$COLL.STR.LOGL, association=c_yk_all.out$ASSOC, significance=c_yk_all.out$SIGNIF)
+```
+
+```{r}
+colnames(m_counts)[2] <- "CORP.FREQ"
+colnames(mtv_df)[2] <- "CXN.FREQ"
+c_m <- merge(m_counts, mtv_df, by="lemma")
+c_m_all <- data.frame(WORD=c_m$lemma, CXN.FREQ=c_m$CXN.FREQ, CORP.FREQ=c_m$CORP.FREQ)
+```
+
+```{r}
+collex(c_m_all, 2547) -> c_m_all.out
+data.frame(word=c_m_all.out$COLLEX, observation=c_m_all.out$OBS, frequency=c_m_all.out$CORP.FREQ, coll_strength=c_m_all.out$COLL.STR.LOGL, association=c_m_all.out$ASSOC, significance=c_m_all.out$SIGNIF)
+```
+
+### Regular and irregular past tense forms
+
+#### Type and token frequency
+
+```{r}
+yk_freqs <- past_tense_seg(yk_pos$av)
+m_freqs <- past_tense_seg(m_pos$av)
+ti <- data.frame(ed_form=rbind(yk_freqs, m_freqs, past_tense_seg(prog_pos$av), past_tense_seg(nonprog_pos$av), past_tense_seg(edu_pos$av), past_tense_seg(nonedu_pos$av)))
+rownames(ti) <- c("YouTube Kids", "Maternal Input", "Programmed", "Non-programmed", "Educational", "Non-educational")
+ti
+```
+
+```{r}
+past_tense_verb_counts <- function(df) {
+  verbs <- df$av %>%
+    filter(tag == "VBN" | tag == "VBD") %>%
+    filter(grepl("ed$", token))
+  return(verbs %>%
+    count(lemma, sort=TRUE))
+}
+past_tense_verbs_yk  <- past_tense_verb_counts(yk_pos)
+past_tense_verbs <- past_tense_verb_counts(m_pos)
+top_words_yk <- past_tense_verbs_yk[order(-past_tense_verbs_yk$n),][1:5,]
+top_words_m <- past_tense_verbs [order(-past_tense_verbs$n),][1:5,]
+data.frame(maternal_top_words=top_words_m, youtubekids_top_words=top_words_yk)
+```
